@@ -86,6 +86,21 @@ def ensure_root() -> None:
         sys.exit("This script must be run as root.")
 
 
+def prompt_for_confirmation() -> None:
+    print(
+        "DISCLAIMER: This automation can modify boot-critical components. "
+        "I am not responsible for a non-booting or corrupted system."
+    )
+    print(
+        "The script will download sources, build packages, install configuration files, "
+        "generate an initramfs, update GRUB, and regenerate /etc/fstab."
+    )
+    print("Review the planned actions above before continuing.")
+    response = input("Enter 'Y' to confirm and continue: ").strip()
+    if response.upper() != "Y":
+        sys.exit("Aborted by user confirmation.")
+
+
 def download(package: Package, destination: Path) -> Path:
     destination.mkdir(parents=True, exist_ok=True)
     target = destination / package.filename
@@ -330,13 +345,16 @@ def parse_arguments() -> argparse.Namespace:
 
 def main() -> None:
     ensure_root()
+    prompt_for_confirmation()
     args = parse_arguments()
     args.workdir.mkdir(parents=True, exist_ok=True)
 
     sources = {}
     if not args.skip_download:
+        print("\n[STEP 1] Preparing package sources (download & extract)")
         sources = prepare_sources(args.workdir)
     else:
+        print("\n[STEP 1] Skipping source downloads (verification only)")
         build_root = args.workdir / "build"
         for pkg in PACKAGES.values():
             source = build_root / pkg.full_name
@@ -345,18 +363,27 @@ def main() -> None:
             sources[pkg.name] = source
 
     if not args.skip_build:
+        print("\n[STEP 2] Building required packages")
         build_util_linux(sources["util-linux"], args.jobs)
         build_busybox(sources["busybox"], args.jobs, args.busybox_config)
         build_mkinitcpio(sources["mkinitcpio"], args.jobs)
+    else:
+        print("\n[STEP 2] Package build skipped")
 
+    print("\n[STEP 3] Installing mkinitcpio configuration")
     mkinitcpio_conf = install_mkinitcpio_config(args.mkinitcpio_config)
+    print("\n[STEP 4] Verifying GRUB installation")
     check_grub_installation()
 
     if not args.skip_initrd:
+        print("\n[STEP 5] Generating initramfs and updating GRUB")
         kernel_version = detect_kernel_version()
         initrd = build_initrd(kernel_version, mkinitcpio_conf)
         update_grub_cfg(initrd, kernel_version)
+    else:
+        print("\n[STEP 5] Initramfs generation skipped")
 
+    print("\n[STEP 6] Regenerating /etc/fstab entries")
     rebuild_fstab()
     print("[DONE] All tasks completed.")
 
