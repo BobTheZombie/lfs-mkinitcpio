@@ -26,6 +26,7 @@ Options:
 * `--busybox-config`: Path to the BusyBox configuration file. Defaults to `configs/busybox.config`.
 * `--mkinitcpio-config`: Path to mkinitcpio configuration. Defaults to `configs/mkinitcpio.conf`.
 * `--skip-download`, `--skip-build`, `--skip-initrd`: Allow reusing previously downloaded sources, skipping compilation, or skipping initramfs generation respectively.
+* `--fake`: Run every filesystem modification inside a fake root under the chosen workdir so you can validate the workflow without touching your live system.
 
 The script will:
 

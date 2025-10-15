@@ -71,7 +71,9 @@ class CommandError(RuntimeError):
     pass
 
 
-def run_command(cmd: Iterable[str], *, cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None) -> None:
+def run_command(
+    cmd: Iterable[str], *, cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None
+) -> None:
     """Execute a command while echoing it to stdout."""
     printable = " ".join(cmd)
     print(f"[CMD] {printable}")
@@ -81,7 +83,9 @@ def run_command(cmd: Iterable[str], *, cwd: Optional[Path] = None, env: Optional
         raise CommandError(f"Command failed with exit code {exc.returncode}: {printable}") from exc
 
 
-def ensure_root() -> None:
+def ensure_root(allow_non_root: bool = False) -> None:
+    if allow_non_root:
+        return
     if os.geteuid() != 0:
         sys.exit("This script must be run as root.")
 
@@ -140,7 +144,7 @@ def prepare_sources(workdir: Path) -> Dict[str, Path]:
     return sources
 
 
-def build_util_linux(source: Path, jobs: int) -> None:
+def build_util_linux(source: Path, jobs: int, *, destdir: Optional[Path] = None) -> None:
     build_dir = source / "build"
     build_dir.mkdir(exist_ok=True)
     configure_cmd = [
@@ -158,32 +162,41 @@ def build_util_linux(source: Path, jobs: int) -> None:
     ]
     run_command(configure_cmd, cwd=build_dir)
     run_command(["make", f"-j{jobs}"], cwd=build_dir)
-    run_command(["make", "install"], cwd=build_dir)
+    install_cmd: List[str] = ["make", "install"]
+    if destdir is not None:
+        install_cmd.append(f"DESTDIR={destdir}")
+    run_command(install_cmd, cwd=build_dir)
 
 
-def build_busybox(source: Path, jobs: int, config_file: Path) -> None:
+def build_busybox(
+    source: Path, jobs: int, config_file: Path, *, destdir: Optional[Path] = None
+) -> None:
     if not config_file.exists():
         raise FileNotFoundError(f"BusyBox config not found: {config_file}")
 
     run_command(["make", "distclean"], cwd=source)
     shutil.copy2(config_file, source / ".config")
     run_command(["make", f"-j{jobs}"], cwd=source)
-    run_command(["make", "CONFIG_PREFIX=/usr", "install"], cwd=source)
+    config_prefix = Path("/usr") if destdir is None else destdir / "usr"
+    run_command(["make", f"CONFIG_PREFIX={config_prefix}", "install"], cwd=source)
 
 
-def build_mkinitcpio(source: Path, jobs: int) -> None:
+def build_mkinitcpio(source: Path, jobs: int, *, destdir: Optional[Path] = None) -> None:
     build_dir = source / "build"
     build_dir.mkdir(exist_ok=True)
     run_command(["meson", "setup", "--prefix=/usr", "--buildtype=release", str(build_dir)], cwd=source)
     run_command(["meson", "compile", "-C", str(build_dir), f"-j{jobs}"], cwd=source)
-    run_command(["meson", "install", "-C", str(build_dir)], cwd=source)
+    install_cmd = ["meson", "install", "-C", str(build_dir)]
+    if destdir is not None:
+        install_cmd.extend(["--destdir", str(destdir)])
+    run_command(install_cmd, cwd=source)
 
 
-def install_mkinitcpio_config(config_file: Path) -> Path:
+def install_mkinitcpio_config(config_file: Path, system_root: Path) -> Path:
     if not config_file.exists():
         raise FileNotFoundError(f"mkinitcpio config not found: {config_file}")
 
-    destination = Path("/etc/mkinitcpio.conf")
+    destination = system_root / "etc/mkinitcpio.conf"
     destination.parent.mkdir(parents=True, exist_ok=True)
     backup = destination.with_suffix(destination.suffix + ".bak")
     if destination.exists() and not backup.exists():
@@ -195,8 +208,8 @@ def install_mkinitcpio_config(config_file: Path) -> Path:
     return destination
 
 
-def detect_kernel_version() -> str:
-    modules_root = Path("/lib/modules")
+def detect_kernel_version(system_root: Path) -> str:
+    modules_root = system_root / "lib/modules"
     if modules_root.exists():
         candidates = [d.name for d in modules_root.iterdir() if d.is_dir()]
         if candidates:
@@ -210,24 +223,38 @@ def detect_kernel_version() -> str:
     return kernel
 
 
-def build_initrd(kernel: str, mkinitcpio_conf: Path) -> Path:
-    initrd_path = Path(f"/boot/initrd.img-{kernel}")
+def build_initrd(
+    kernel: str,
+    mkinitcpio_conf: Path,
+    system_root: Path,
+    *,
+    fake: bool,
+) -> Path:
+    initrd_path = system_root / f"boot/initrd.img-{kernel}"
     initrd_path.parent.mkdir(parents=True, exist_ok=True)
-    run_command([
-        "mkinitcpio",
-        "-g",
-        str(initrd_path),
-        "-k",
-        kernel,
-        "-c",
-        str(mkinitcpio_conf),
-    ])
+    env = None
+    if fake:
+        env = os.environ.copy()
+        fake_path = system_root / "usr/bin"
+        env["PATH"] = f"{fake_path}:{env.get('PATH', '')}"
+    run_command(
+        [
+            "mkinitcpio",
+            "-g",
+            str(initrd_path),
+            "-k",
+            kernel,
+            "-c",
+            str(mkinitcpio_conf),
+        ],
+        env=env,
+    )
     print(f"[INFO] Generated {initrd_path}")
     return initrd_path
 
 
-def update_grub_cfg(initrd_path: Path, kernel: str) -> None:
-    grub_cfg = Path("/boot/grub/grub.cfg")
+def update_grub_cfg(initrd_path: Path, kernel: str, system_root: Path) -> None:
+    grub_cfg = system_root / "boot/grub/grub.cfg"
     if not grub_cfg.exists():
         print("[WARN] GRUB configuration not found. Please ensure GRUB is installed per the LFS/BLFS book.")
         return
@@ -281,8 +308,9 @@ class FstabEntry:
         return f"UUID={self.uuid}\t{self.mountpoint}\t{self.fstype}\t{options}\t{dump}\t{passno}"
 
 
-def rebuild_fstab() -> None:
-    existing = Path("/etc/fstab")
+def rebuild_fstab(system_root: Path) -> None:
+    existing = system_root / "etc/fstab"
+    existing.parent.mkdir(parents=True, exist_ok=True)
     backup = existing.with_suffix(".bak")
     if existing.exists() and not backup.exists():
         shutil.copy2(existing, backup)
@@ -318,14 +346,18 @@ def rebuild_fstab() -> None:
         print("[WARN] No mounted devices discovered; skipping fstab regeneration.")
         return
 
-    new_content = "# Generated by lfs_initrd_setup.py\n" + "\n".join(entry.to_line() for entry in entries) + "\n"
+    new_content = (
+        "# Generated by lfs_initrd_setup.py\n"
+        + "\n".join(entry.to_line() for entry in entries)
+        + "\n"
+    )
     existing.write_text(new_content)
     print("[INFO] Regenerated /etc/fstab using UUIDs")
 
 
-def check_grub_installation() -> None:
-    grub_cfg = Path("/boot/grub/grub.cfg")
-    grub_dir = grub_cfg.parent if grub_cfg.exists() else Path("/boot/grub")
+def check_grub_installation(system_root: Path) -> None:
+    grub_cfg = system_root / "boot/grub/grub.cfg"
+    grub_dir = grub_cfg.parent if grub_cfg.exists() else system_root / "boot/grub"
     grub_install = shutil.which("grub-install")
     if not grub_dir.exists() or grub_install is None:
         print("[WARN] GRUB installation not detected. Please consult the LFS/BLFS book and install GRUB before running this script again.")
@@ -340,14 +372,23 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--skip-download", action="store_true", help="Skip downloading and extracting sources")
     parser.add_argument("--skip-build", action="store_true", help="Skip building packages")
     parser.add_argument("--skip-initrd", action="store_true", help="Skip creating initramfs and updating bootloader")
+    parser.add_argument(
+        "--fake",
+        action="store_true",
+        help="Operate entirely within a fake root under the workdir to avoid touching system files",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
-    ensure_root()
-    prompt_for_confirmation()
     args = parse_arguments()
+    ensure_root(allow_non_root=args.fake)
+    prompt_for_confirmation()
     args.workdir.mkdir(parents=True, exist_ok=True)
+
+    system_root = args.workdir / "fake_root" if args.fake else Path("/")
+    if args.fake:
+        system_root.mkdir(parents=True, exist_ok=True)
 
     sources = {}
     if not args.skip_download:
@@ -364,27 +405,28 @@ def main() -> None:
 
     if not args.skip_build:
         print("\n[STEP 2] Building required packages")
-        build_util_linux(sources["util-linux"], args.jobs)
-        build_busybox(sources["busybox"], args.jobs, args.busybox_config)
-        build_mkinitcpio(sources["mkinitcpio"], args.jobs)
+        destdir = system_root if args.fake else None
+        build_util_linux(sources["util-linux"], args.jobs, destdir=destdir)
+        build_busybox(sources["busybox"], args.jobs, args.busybox_config, destdir=destdir)
+        build_mkinitcpio(sources["mkinitcpio"], args.jobs, destdir=destdir)
     else:
         print("\n[STEP 2] Package build skipped")
 
     print("\n[STEP 3] Installing mkinitcpio configuration")
-    mkinitcpio_conf = install_mkinitcpio_config(args.mkinitcpio_config)
+    mkinitcpio_conf = install_mkinitcpio_config(args.mkinitcpio_config, system_root)
     print("\n[STEP 4] Verifying GRUB installation")
-    check_grub_installation()
+    check_grub_installation(system_root)
 
     if not args.skip_initrd:
         print("\n[STEP 5] Generating initramfs and updating GRUB")
-        kernel_version = detect_kernel_version()
-        initrd = build_initrd(kernel_version, mkinitcpio_conf)
-        update_grub_cfg(initrd, kernel_version)
+        kernel_version = detect_kernel_version(system_root)
+        initrd = build_initrd(kernel_version, mkinitcpio_conf, system_root, fake=args.fake)
+        update_grub_cfg(initrd, kernel_version, system_root)
     else:
         print("\n[STEP 5] Initramfs generation skipped")
 
     print("\n[STEP 6] Regenerating /etc/fstab entries")
-    rebuild_fstab()
+    rebuild_fstab(system_root)
     print("[DONE] All tasks completed.")
 
 
