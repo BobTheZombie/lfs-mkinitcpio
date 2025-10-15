@@ -50,8 +50,8 @@ class Package:
 PACKAGES: Dict[str, Package] = {
     "util-linux": Package(
         name="util-linux",
-        version="2.39.3",
-        url="https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.39/util-linux-2.39.3.tar.xz",
+        version="2.41.1",
+        url="https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.41/util-linux-2.41.1.tar.gz",
     ),
     "busybox": Package(
         name="busybox",
@@ -152,13 +152,14 @@ def build_util_linux(source: Path, jobs: int, *, destdir: Optional[Path] = None)
         "--prefix=/usr",
         "--sysconfdir=/etc",
         "--localstatedir=/var",
-        "--disable-chfn-chsh",
-        "--disable-login",
-        "--disable-nologin",
-        "--disable-su",
-        "--disable-runuser",
-        "--without-python",
-        "--without-systemd",
+        "--enable-uuidd",
+        "--disable-makeinstall-chown",
+        "--disable-chfn-chsh-password",
+        "--with-systemd",
+        "--disable-static",
+        "--enable-write",
+        "--enable-chfn-chsh",
+        "--with-systemdsystemunitdir=/usr/lib/systemd/system"
     ]
     run_command(configure_cmd, cwd=build_dir)
     run_command(["make", f"-j{jobs}"], cwd=build_dir)
