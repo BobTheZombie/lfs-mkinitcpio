@@ -53,6 +53,11 @@ PACKAGES: Dict[str, Package] = {
         version="2.41.1",
         url="https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.41/util-linux-2.41.1.tar.gz",
     ),
+    "libarchive": Package(
+        name="libarchive",
+        version="3.7.4",
+        url="https://libarchive.org/downloads/libarchive-3.7.4.tar.gz",
+    ),
     "busybox": Package(
         name="busybox",
         version="1.36.1",
@@ -132,16 +137,30 @@ def extract(archive: Path, destination: Path) -> Path:
     return destination / archive.stem
 
 
-def prepare_sources(workdir: Path) -> Dict[str, Path]:
-    """Download and extract all package sources."""
+def prepare_sources(workdir: Path, packages: Iterable[Package]) -> Dict[str, Path]:
+    """Download and extract the requested package sources."""
     sources: Dict[str, Path] = {}
     tarball_dir = workdir / "sources"
     build_dir = workdir / "build"
-    for pkg in PACKAGES.values():
+    for pkg in packages:
         archive = download(pkg, tarball_dir)
         source_root = extract(archive, build_dir)
         sources[pkg.name] = source_root
     return sources
+
+
+def build_libarchive(source: Path, jobs: int, *, destdir: Optional[Path] = None) -> None:
+    configure_cmd = [
+        str(source / "configure"),
+        "--prefix=/usr",
+        "--disable-static",
+    ]
+    run_command(configure_cmd, cwd=source)
+    run_command(["make", f"-j{jobs}"], cwd=source)
+    install_cmd: List[str] = ["make", "install"]
+    if destdir is not None:
+        install_cmd.append(f"DESTDIR={destdir}")
+    run_command(install_cmd, cwd=source)
 
 
 def build_util_linux(source: Path, jobs: int, *, destdir: Optional[Path] = None) -> None:
@@ -191,6 +210,14 @@ def build_mkinitcpio(source: Path, jobs: int, *, destdir: Optional[Path] = None)
     if destdir is not None:
         install_cmd.extend(["--destdir", str(destdir)])
     run_command(install_cmd, cwd=source)
+
+
+def libarchive_installed() -> bool:
+    try:
+        subprocess.run(["pkg-config", "--exists", "libarchive"], check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+    return True
 
 
 def install_mkinitcpio_config(config_file: Path, system_root: Path) -> Path:
@@ -391,14 +418,21 @@ def main() -> None:
     if args.fake:
         system_root.mkdir(parents=True, exist_ok=True)
 
+    needs_libarchive_build = args.fake or not libarchive_installed()
+    packages_to_prepare = [
+        pkg
+        for pkg in PACKAGES.values()
+        if pkg.name != "libarchive" or (needs_libarchive_build and not args.skip_build)
+    ]
+
     sources = {}
     if not args.skip_download:
         print("\n[STEP 1] Preparing package sources (download & extract)")
-        sources = prepare_sources(args.workdir)
+        sources = prepare_sources(args.workdir, packages_to_prepare)
     else:
         print("\n[STEP 1] Skipping source downloads (verification only)")
         build_root = args.workdir / "build"
-        for pkg in PACKAGES.values():
+        for pkg in packages_to_prepare:
             source = build_root / pkg.full_name
             if not source.exists():
                 sys.exit(f"Expected source directory {source} is missing. Remove --skip-download to fetch sources.")
@@ -407,6 +441,11 @@ def main() -> None:
     if not args.skip_build:
         print("\n[STEP 2] Building required packages")
         destdir = system_root if args.fake else None
+        if needs_libarchive_build:
+            print("[INFO] libarchive not detected; building from source")
+            build_libarchive(sources["libarchive"], args.jobs, destdir=destdir)
+        else:
+            print("[SKIP] libarchive already installed; skipping build")
         build_util_linux(sources["util-linux"], args.jobs, destdir=destdir)
         build_busybox(sources["busybox"], args.jobs, args.busybox_config, destdir=destdir)
         build_mkinitcpio(sources["mkinitcpio"], args.jobs, destdir=destdir)
